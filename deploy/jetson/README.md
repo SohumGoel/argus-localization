@@ -161,7 +161,9 @@ git -C ~/argus-localization/third_party/salad checkout 6aede13
 /home/argus/miniconda3/envs/sat_env_vision/bin/python -m venv --system-site-packages ~/venv-export
 ~/venv-export/bin/pip install onnx onnxruntime onnxscript shapely "numpy<2.2" kornia==0.7.1
 ~/venv-export/bin/pip install --no-deps git+https://github.com/cvg/LightGlue.git
-git -C ~/argus-localization checkout jetson-deployment   # this folder is deploy/jetson/ on that branch
+git -C ~/argus-localization remote add sohum https://github.com/SohumGoel/argus-localization.git
+git -C ~/argus-localization fetch sohum
+git -C ~/argus-localization checkout -b jetson-deployment sohum/jetson-deployment   # this folder is deploy/jetson/ on that branch
 ```
 - Run everything with `~/venv-export/bin/python`, from `~/argus-localization`. Plain `python3` has no PyTorch.
 - Scripts were tested at repo commit `cc75c2b`. The matcher and georeferencing files are unchanged up to `476ee54`.
