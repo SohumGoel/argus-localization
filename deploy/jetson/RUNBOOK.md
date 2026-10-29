@@ -288,13 +288,13 @@ python3 compare_topk.py --data e2e_alps_full --ks 15 10 5
 python3 compare_topk.py --data e2e_alps_full --tags base10 mp kp512 mp_kp512
 ```
 
-### 7. Stage-by-stage pictures (`PIPELINE-WALKTHROUGH.md`)
+### 7. Stage-by-stage pictures (`walkthrough/PIPELINE-WALKTHROUGH.md`)
 ```bash
 # Jetson
 cd ~/Desktop/astroloc/repo
 PYTHONPATH=~/Desktop/astroloc/pydeps python3 ../pipeline_trace.py --out ../trace
-# Mac, after copying ~/Desktop/astroloc/trace to deploy/jetson/pipeline_walkthrough/data
-cd export && .venv/bin/python visualize_trace.py --trace pipeline_walkthrough/data --out pipeline_walkthrough
+# Mac, from deploy/jetson/, after copying ~/Desktop/astroloc/trace to walkthrough/pipeline_walkthrough/data (needs matplotlib)
+python3 visualize_trace.py --trace walkthrough/pipeline_walkthrough/data --out walkthrough/pipeline_walkthrough
 ```
 
 ## Scripts (in `deploy/jetson/`)
@@ -314,7 +314,7 @@ cd export && .venv/bin/python visualize_trace.py --trace pipeline_walkthrough/da
 | `test_batched_lightglue.py` | either | checks batched LightGlue against one tile at a time |
 | `profile_full.py` | Jetson | time, CPU, GPU, memory and disk cost of every step (run with `tegrastats` for power) |
 | `lg_bench.py` | Jetson | one LightGlue pair repeated, for `nsys profile -t cuda,nvtx` |
-| `pipeline_trace.py`, `visualize_trace.py` | Jetson, Mac | record and draw every stage for one success and one failure; see `PIPELINE-WALKTHROUGH.md` |
+| `pipeline_trace.py`, `visualize_trace.py` | Jetson, Mac | record and draw every stage for one success and one failure; see `walkthrough/PIPELINE-WALKTHROUGH.md` |
 | `export_onnx.py` | workstation | PyTorch → ONNX, with a parity check |
 | `check_engine.py`, `compare_precision.py`, `test_images.py` | Jetson | engine sanity, FP32 vs FP16, real-image check |
 
