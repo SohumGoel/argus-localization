@@ -41,7 +41,7 @@ The matcher checks the top 15 retrieved tiles and declares a fix when one has �
 
 Each step was checked on the same 200 photos; accuracy held at every step (fix on ~55% of photos, ~16 km median error).
 
-| Change (date) | Time per photo | Energy per photo |
+| Change | Time per photo | Energy per photo |
 |---|---|---|
 | Full flow on the Jetson, first version | 3.3 s | ~26 J |
 | Tile SIFT features computed once and stored | 1.3 s | ~14 J |
@@ -50,6 +50,22 @@ Each step was checked on the same 200 photos; accuracy held at every step (fix o
 | **Search on the GPU + tile features in one file (current)** | **0.73 s** | **~6 J** |
 
 Tried and not adopted: see *Experiment log* below.
+
+### Accuracy: original vs now
+
+Same 200 held-out photos.
+- **Fix rate:** % of photos the system locates confidently (≥ 30 matched points on a tile). The rest get "no fix": no answer rather than a guess.
+- **Error:** km between the estimated and the true photo centre, for fixes only.
+
+| | Original (3.3 s) | **Current default (0.73 s)** | TensorRT LightGlue (0.65 s, testing) |
+|---|---|---|---|
+| Setup | top 15 tiles, full precision | top 10 tiles, LightGlue half precision | as current, LightGlue as a TensorRT FP16 engine |
+| Fix rate | 54.5% (109) | **55.0% (110)** | 54.0% (108) |
+| Median error | 15.9 km | **15.8 km** | 15.9 km |
+| 90% of fixes within | 33.2 km | 32.7 km | 32.0 km |
+| Fixes > 50 km off | 4 | 4 | 3 |
+
+Retrieval is identical in all three (right tile ranked first on 68.5% of photos).
 
 ### Setup
 - **Nano v2:** `nano_train/checkpoints_v2/final.pt` (27M, 512-d).
@@ -157,6 +173,8 @@ One change at a time, against a same-day baseline, on the 200 test photos, with 
 | Search on the GPU + tile features in one memory-mapped file | 0.82 → 0.73 s | identical on 200/200 | 7 → 6 J | adopted |
 | Tile features preloaded in GPU memory | 0.74 s | identical; +1.8 GB memory | 6 J | rejected |
 | Batched LightGlue (10 tiles in one call) | 0.83 s | loses 1 fix | 8 J | rejected: no flash attention with masks, no point pruning |
+| LightGlue as a TensorRT FP16 engine (`lightglue_trt.py`) | 0.74 → 0.65 s | loses 2 of 110 fixes; one fewer fix > 50 km | 6 → 5 J | testing; not default yet |
+| LightGlue as a TensorRT FP32 engine | 1.18 s | +2 fixes | 13 J | rejected: slower |
 
 The workstation (RTX 4090) runs the same flow at 0.80 s with tile SIFT per photo and 0.22 s with stored features.
 
