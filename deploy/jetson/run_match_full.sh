@@ -7,7 +7,7 @@
 TAG=${1:-}; [ $# -gt 0 ] && shift
 SUF=${TAG:+_$TAG}
 cd ~/Desktop/astroloc/repo
-D=../e2e_alps_full
+D=${D:-../e2e_alps_full}   # override for another test set, e.g. D=../e2e_geotiff
 rm -f $D/tegrastats_match$SUF.log
 tegrastats --interval 1000 --logfile $D/tegrastats_match$SUF.log &
 TP=$!

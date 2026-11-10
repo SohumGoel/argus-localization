@@ -55,6 +55,40 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 6371.0 * 2 * math.asin(math.sqrt(a))
 
 
+def _gnomonic_km(lat, lon, lat0, lon0):
+    """Points on the sphere projected onto the tangent plane at (lat0, lon0), in km."""
+    la, lo, la0, lo0 = (np.radians(np.asarray(x, dtype=float)) for x in (lat, lon, lat0, lon0))
+    p = np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], -1)
+    e = np.array([-np.sin(lo0), np.cos(lo0), 0.0])
+    n = np.array([-np.sin(la0) * np.cos(lo0), -np.sin(la0) * np.sin(lo0), np.cos(la0)])
+    u = np.array([np.cos(la0) * np.cos(lo0), np.cos(la0) * np.sin(lo0), np.sin(la0)])
+    return 6371.0 * np.stack([p @ e, p @ n], -1) / (p @ u)[:, None]
+
+
+def tie_point_error_km(filename, shape, tie_points):
+    """Median distance between a fix's tie points and the true ground points of their pixels.
+
+    Truth per pixel comes from the photo's four true corners (in its filename: BL TL TR BR lat/lon),
+    through a homography from the photo onto the ground's tangent plane. Against exact truth this is
+    within ~0.2 km on the Argus-like GeoTIFF frames and ~1 km on perspective renders. This is the
+    error OD sees; match_error_km (footprint centre) extrapolates to the photo corners and reads higher.
+    """
+    corners = np.array([f for f in os.path.splitext(os.path.basename(filename))[0].split("@") if f][:8],
+                       dtype=float).reshape(4, 2)
+    h, w = shape
+    lat0, lon0 = corners.mean(axis=0)
+    src = np.array([[0, h], [0, 0], [w, 0], [w, h]], dtype=float)
+    dst = _gnomonic_km(corners[:, 0], corners[:, 1], lat0, lon0)
+    rows = []
+    for (x, y), (a, b) in zip(src, dst):
+        rows += [[x, y, 1, 0, 0, 0, -a * x, -a * y, -a], [0, 0, 0, x, y, 1, -b * x, -b * y, -b]]
+    H = np.linalg.svd(np.array(rows))[2][-1].reshape(3, 3)
+    tp = np.asarray(tie_points, dtype=float)
+    q = np.column_stack([tp[:, :2] + 0.5, np.ones(len(tp))]) @ H.T
+    truth = q[:, :2] / q[:, 2:]
+    return float(np.median(np.linalg.norm(truth - _gnomonic_km(tp[:, 2], tp[:, 3], lat0, lon0), axis=1)))
+
+
 # ---- preprocessing: must stay byte-identical to e2e_prepare.py / e2e_jetson.py ----
 def preprocess(img):
     x = np.asarray(img.resize((SIZE, SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
@@ -115,7 +149,7 @@ class TilePack:
         self.tile_shape = np.load(os.path.join(pack_dir, "tile_shape.npy"))
         self.tile_ids = json.load(open(os.path.join(pack_dir, "tile_ids.json")))
 
-    def feats(self, idx):
+    def feats(self, idx, max_keypoints=None):
         n = int(self.counts[idx])
         if self.on_gpu:
             out = {k: self.arrays[k][idx:idx + 1, :n] for k in self.KEYS}
@@ -123,6 +157,9 @@ class TilePack:
             out = {k: torch.from_numpy(np.ascontiguousarray(self.arrays[k][idx:idx + 1, :n])).to(self.device)
                    for k in self.KEYS}
         out["image_size"] = self.image_size[idx:idx + 1]
+        if max_keypoints and n > max_keypoints:  # keep the highest-scoring points, as SIFT itself would
+            keep = torch.topk(out["keypoint_scores"][0].float(), max_keypoints).indices
+            out = {k: (v[:, keep] if v.dim() > 1 and v.shape[1] == n else v) for k, v in out.items()}
         return out, tuple(int(x) for x in self.tile_shape[idx])
 
 
@@ -245,6 +282,13 @@ def summarize(records, label):
             "fix_max_error_km": round(float(errs.max()), 1),
             "fixes_over_50km": int((errs > 50).sum()),
         })
+        tie = np.array([r["tie_error_km"] for r in fixes if r.get("tie_error_km") is not None])
+        if len(tie):
+            out.update({
+                "fix_tie_point_error_median_km": round(float(np.median(tie)), 2),
+                "fix_tie_point_error_p90_km": round(float(np.percentile(tie, 90)), 2),
+                "fix_tie_point_error_max_km": round(float(tie.max()), 2),
+            })
     return out
 
 
@@ -261,14 +305,28 @@ def main():
                          "if given, tile images are not opened")
     ap.add_argument("--max-keypoints", type=int, default=1024,
                     help="SIFT points per image (repo default 1024); stored tile features are cut to match")
+    ap.add_argument("--lightglue-layers", type=int, default=None,
+                    help="stop LightGlue after this many of its 9 layers and use that layer's matches "
+                         "(each layer has its own match head; same weights, no retraining)")
     ap.add_argument("--lightglue-mp", action="store_true",
                     help="run LightGlue in mixed (half) precision")
     ap.add_argument("--tile-pack", default=None,
                     help="folder from pack_tile_feats.py; replaces --tile-feats (needs --lightglue-mp)")
     ap.add_argument("--tiles-on-gpu", action="store_true", help="load the whole tile pack into GPU memory")
     ap.add_argument("--search-on-gpu", action="store_true", help="run the fingerprint search on the GPU")
+    ap.add_argument("--lightglue-trt", default=None,
+                    help="LightGlue as a TensorRT engine (lightglue_trt.py) instead of PyTorch")
     ap.add_argument("--batch-tiles", action="store_true",
                     help="match all candidate tiles in one batched LightGlue call (needs --tile-pack or --tile-feats)")
+    ap.add_argument("--stop-inliers", type=int, default=0,
+                    help="stop matching a photo's candidates at the first tile with at least this many "
+                         "inliers (0 = match all; TensorRT LightGlue path only)")
+    ap.add_argument("--log-tiles", action="store_true",
+                    help="record every candidate tile's inliers and the fix error it would give "
+                         "(for testing stop rules offline; adds georeferencing time)")
+    ap.add_argument("--save-tie-points", action="store_true",
+                    help="store each fix's tie points [u, v, lat, lon] (photo pixels, inliers of the chosen tile), "
+                         "the measurements orbit determination uses")
     ap.add_argument("--top-k", type=int, default=15)
     ap.add_argument("--min-inliers", type=int, default=30)
     ap.add_argument("--limit", type=int, default=0, help="only the first N photos (0 = all)")
@@ -304,6 +362,10 @@ def main():
 
     matcher = SiftLightGlueMatcher(min_inliers=args.min_inliers, max_num_keypoints=args.max_keypoints)
     matcher.matcher.conf.mp = args.lightglue_mp
+    if args.lightglue_layers:
+        if not 1 <= args.lightglue_layers <= len(matcher.matcher.transformers):
+            sys.exit(f"ERROR: --lightglue-layers must be 1-{len(matcher.matcher.transformers)}")
+        matcher.matcher.conf.n_layers = args.lightglue_layers
     georef = Georeferencer()
     print(f"matcher on: {matcher.device} | SIFT points per image: {args.max_keypoints} | "
           f"LightGlue precision: {'mixed (half)' if args.lightglue_mp else 'full (32-bit)'}")
@@ -316,8 +378,8 @@ def main():
         print(f"tile features: precomputed, from {feats_dir}")
     pack = None
     if args.tile_pack:
-        if not args.lightglue_mp:
-            sys.exit("ERROR: --tile-pack stores descriptors in float16; use it with --lightglue-mp")
+        if not (args.lightglue_mp or args.lightglue_trt):
+            sys.exit("ERROR: --tile-pack stores descriptors in float16; use it with --lightglue-mp or --lightglue-trt")
         pack = TilePack(os.path.expanduser(args.tile_pack), matcher.device, args.tiles_on_gpu)
         if pack.tile_ids != [m["tile_id"] for m in db_meta]:
             sys.exit("ERROR: tile pack order does not match db_tiles.json")
@@ -325,6 +387,11 @@ def main():
     db_gpu = torch.from_numpy(db_vecs).to(matcher.device) if args.search_on_gpu else None
     if args.batch_tiles:
         print("LightGlue: all candidate tiles in one batched call")
+    lg_trt = None
+    if args.lightglue_trt:
+        from lightglue_trt import LightGlueTRT
+        lg_trt = LightGlueTRT(args.lightglue_trt, threshold=matcher.matcher.conf.filter_threshold)
+        print(f"LightGlue: TensorRT engine {args.lightglue_trt} ({lg_trt.k} points)")
 
     records, times, cosines = [], [], []
     for i, (qm, qv) in enumerate(zip(queries, q_vecs if q_vecs is not None else [None] * len(queries))):
@@ -347,12 +414,41 @@ def main():
         photo_feats = extract(photo)
         matcher._extract = lambda im, _p=photo, _f=photo_feats: _f if im is _p else extract(im)
         best, best_idx, best_shape, best_rank = None, None, None, None
+        tile_log, tiles_matched = [], 0
         try:
-            if args.batch_tiles:
+            if lg_trt is not None:
+                lg_trt.set_photo(photo_feats)
+                kp0 = photo_feats["keypoints"][0]
+                for rank, idx in enumerate(candidates):
+                    if pack is not None:
+                        tf, tile_shape = pack.feats(idx, args.max_keypoints)
+                    else:
+                        stored = np.load(os.path.join(feats_dir, tiles[idx].tile_id + ".npz"))
+                        tf = stored_tile_feats(stored, matcher.device, args.max_keypoints)
+                        tile_shape = tuple(int(x) for x in stored["tile_shape"])
+                    mt = lg_trt.match(tf)
+                    qp = kp0[mt[:, 0]].float().cpu().numpy()
+                    tp = tf["keypoints"][0][mt[:, 1]].float().cpu().numpy()
+                    m = homography_check(qp, tp, matcher.max_ransac_iters)
+                    tiles_matched = rank + 1
+                    if best is None or m.num_inliers > best.num_inliers:
+                        best, best_idx, best_shape, best_rank = m, int(idx), tile_shape, rank
+                    if args.log_tiles:
+                        err = None
+                        if m.num_inliers >= args.min_inliers:
+                            fp = georef.estimate_query_footprint(m, tiles[idx], photo.shape, tile_shape)
+                            if fp is not None and np.isfinite(fp).all():
+                                c = fp.mean(axis=0)
+                                err = round(haversine_km(truth[0], truth[1], float(c[0]), float(c[1])), 2)
+                        tile_log.append({"inliers": int(m.num_inliers), "correct": int(idx) in positives,
+                                         "error_km": err})
+                    if args.stop_inliers and m.num_inliers >= args.stop_inliers:
+                        break
+            elif args.batch_tiles:
                 loaded = []
                 for idx in candidates:
                     if pack is not None:
-                        loaded.append(pack.feats(idx))
+                        loaded.append(pack.feats(idx, args.max_keypoints))
                     else:
                         stored = np.load(os.path.join(feats_dir, tiles[idx].tile_id + ".npz"))
                         loaded.append((stored_tile_feats(stored, matcher.device, args.max_keypoints),
@@ -366,10 +462,10 @@ def main():
                     m = homography_check(qp, tp, matcher.max_ransac_iters)
                     if best is None or m.num_inliers > best.num_inliers:
                         best, best_idx, best_shape, best_rank = m, int(idx), tile_shape, rank
-            for rank, idx in enumerate([] if args.batch_tiles else candidates):
+            for rank, idx in enumerate([] if (args.batch_tiles or lg_trt is not None) else candidates):
                 if pack is not None:
                     tile_id = tiles[idx].tile_id
-                    tf, tile_shape = pack.feats(idx)
+                    tf, tile_shape = pack.feats(idx, args.max_keypoints)
                     matcher._tile_feats_cache[tile_id] = tf
                     m = matcher.match(photo, None, tile_id=tile_id)
                     matcher._tile_feats_cache.clear()
@@ -400,6 +496,7 @@ def main():
             "correct_in_topk": bool(positives.intersection(int(c) for c in candidates)),
             "best_inliers": int(best.num_inliers),
             "best_rank": best_rank,
+            "tiles_matched": tiles_matched or len(candidates),
             "fix": False,
         }
         if best.num_inliers >= args.min_inliers:
@@ -412,6 +509,15 @@ def main():
                     "match_error_km": haversine_km(truth[0], truth[1], float(centre[0]), float(centre[1])),
                 })
         times.append(time.perf_counter() - t0)
+        if rec["fix"]:  # scoring only, outside the timed part
+            tps = [[round(tp.u, 2), round(tp.v, 2), round(tp.lat, 6), round(tp.lon, 6)]
+                   for tp in georef.make_tie_points(best, tiles[best_idx], best_shape)]
+            rec["tie_error_km"] = round(tie_point_error_km(qm["file"], photo.shape[:2], tps), 3)
+            if args.save_tie_points:
+                rec["photo_shape"] = list(photo.shape[:2])
+                rec["tie_points"] = tps
+        if args.log_tiles:
+            rec["tiles"] = tile_log
         records.append(rec)
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(queries)} photos, {np.median(times):.2f} s/photo")
@@ -421,6 +527,7 @@ def main():
         "excluded_from_training": summarize([r for r in records if r["excluded_from_training"]],
                                             "photos the model cannot have trained on"),
         "seconds_per_photo_median": round(float(np.median(times)), 2),
+        "seconds_per_photo_mean": round(float(np.mean(times)), 3),
         "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 0),
         "top_k": args.top_k,
         "min_inliers": args.min_inliers,
@@ -428,8 +535,10 @@ def main():
         "tile_feats": "precomputed" if feats_dir else "computed per photo",
         "max_keypoints": args.max_keypoints,
         "tile_pack": bool(args.tile_pack), "tiles_on_gpu": args.tiles_on_gpu,
-        "search_on_gpu": args.search_on_gpu, "batch_tiles": args.batch_tiles,
-        "lightglue_mp": args.lightglue_mp,
+        "search_on_gpu": args.search_on_gpu, "batch_tiles": args.batch_tiles, "lightglue_trt": args.lightglue_trt,
+        "lightglue_mp": args.lightglue_mp, "lightglue_layers": args.lightglue_layers or 9,
+        "stop_inliers": args.stop_inliers, "log_tiles": args.log_tiles,
+        "tiles_matched_mean": round(float(np.mean([r["tiles_matched"] for r in records])), 2),
     }
     if cosines:
         summary["fingerprint_cosine_min_vs_" + os.path.splitext(args.query_vecs)[0]] = round(min(cosines), 6)

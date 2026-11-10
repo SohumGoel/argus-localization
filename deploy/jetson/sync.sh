@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./config.sh
 FILES=$(ls *.py *.sh | grep -v -e '^sync.sh$' -e '^config.sh$')
-FILES="$FILES $(ls two_frame/*.py)"
+FILES="$FILES $(ls two_frame/*.py od/*.py)"
 case "${1:-}" in
   workstation) DEST_DESC="$WS:~/$WS_REPO/deploy/jetson/"; ;;
   jetson)      DEST_DESC="$JETSON:~/$JETSON_DIR/ (via $WS)"; ;;

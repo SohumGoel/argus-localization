@@ -1,7 +1,5 @@
 # Jetson Localization Runbook
 
-Results and their history. For setup and commands, start with `README.md`. Paths here are as on the workstation, where this folder sits at `~/argus-localization/deploy/jetson/`.
-
 Running AstroLoc localization on the Jetson Orin Nano: photo → retriever → search → matcher → location.
 
 ## Status (current)
@@ -37,7 +35,7 @@ The matcher checks the top 15 retrieved tiles and declares a fix when one has �
 - Same fix / no-fix decision as the workstation on 199 of 200 photos; where both fix, the locations differ by 0.02 km median (5.9 km max).
 - On the 169 photos excluded from training: 53.8% fix rate, 16.1 km median error.
 
-### Speed on the Jetson: 3.3 s → 0.73 s per photo
+### Speed on the Jetson: 3.3 s → 0.44 s per photo
 
 Each step was checked on the same 200 photos; accuracy held at every step (fix on ~55% of photos, ~16 km median error).
 
@@ -47,7 +45,11 @@ Each step was checked on the same 200 photos; accuracy held at every step (fix o
 | Tile SIFT features computed once and stored | 1.3 s | ~14 J |
 | Top 10 candidate tiles instead of 15 | 0.95 s | ~10 J |
 | LightGlue in half precision | 0.81 s | ~7 J |
-| **Search on the GPU + tile features in one file (current)** | **0.73 s** | **~6 J** |
+| Search on the GPU + tile features in one file | 0.73 s | ~6 J |
+| LightGlue as a TensorRT FP16 engine, 1,024 points | 0.64 s | ~5 J |
+| **Stop at the first tile with ≥ 30 inliers instead of matching all 10 (current)** | **0.44 s mean** (0.34–0.38 s median) | **~3.3 J** |
+
+With the stop rule, a photo that gets a fix takes 0.2–0.4 s; a photo with no fix still checks all 10 tiles (~0.65 s, the worst case).
 
 Tried and not adopted: see *Experiment log* below.
 
@@ -57,13 +59,13 @@ Same 200 held-out photos.
 - **Fix rate:** % of photos the system locates confidently (≥ 30 matched points on a tile). The rest get "no fix": no answer rather than a guess.
 - **Error:** km between the estimated and the true photo centre, for fixes only.
 
-| | Original (3.3 s) | **Current default (0.73 s)** | TensorRT LightGlue (0.65 s, testing) |
+| | Original (3.3 s) | TensorRT LightGlue, all 10 tiles (0.65 s) | **Current: + stop at first good tile (0.45 s mean)** |
 |---|---|---|---|
-| Setup | top 15 tiles, full precision | top 10 tiles, LightGlue half precision | as current, LightGlue as a TensorRT FP16 engine |
-| Fix rate | 54.5% (109) | **55.0% (110)** | 54.0% (108) |
-| Median error | 15.9 km | **15.8 km** | 15.9 km |
-| 90% of fixes within | 33.2 km | 32.7 km | 32.0 km |
-| Fixes > 50 km off | 4 | 4 | 3 |
+| Setup | top 15 tiles, full precision | top 10 tiles, LightGlue as a TensorRT FP16 engine | same, stop at the first tile with ≥ 30 inliers |
+| Fix rate | 54.5% (109) | 54.0% (108) | 54.0% (108) |
+| Median error | 15.9 km | 15.9 km | 15.6 km |
+| 90% of fixes within | 33.2 km | 32.0 km | 32.5 km |
+| Fixes > 50 km off | 4 | 3 | 3 |
 
 Retrieval is identical in all three (right tile ranked first on 68.5% of photos).
 
@@ -77,8 +79,28 @@ Retrieval is identical in all three (right tile ranked first on 68.5% of photos)
 - **Full-size beats nano v2:** 2× the hit rate, 13× lower error.
 - **The matcher is essential:** 79 km → 16 km, with a fix on about half the photos.
 - **8 GB is enough:** 4.0 GB peak memory for the whole flow.
-- **Time is the main cost:** 0.73 s per photo now (3.3 s originally), mostly LightGlue on the GPU.
+- **Time is the main cost:** 0.44 s per photo on average now (3.3 s originally), mostly LightGlue on the GPU.
 - **4 of 109 fixes are wrong by > 50 km:** these need filtering before OD.
+
+## Square Argus-like frames
+
+208 simulated Argus frames: centre squares of the Landsat-8 GeoTIFFs (`/mnt/sda2/geotiffs`, 13 per zone across 16 zones), ~454 km across, resampled to 1024 × 1024. Built with `prepare_geotiff_set.py`; on the Jetson in `e2e_geotiff/`. Same database (2021 zoom 9, full-size model).
+
+| 208 frames, Jetson | LightGlue PyTorch, half precision | LightGlue TensorRT, 1,024 points, all 10 tiles | **+ stop at first tile with ≥ 30 inliers (current)** | LightGlue TensorRT, 768 points |
+|---|---|---|---|---|
+| Fix rate | 57.2% (119) | 59.6% (124) | **59.6% (124)** | 42.8% (89) |
+| Median error / 90% within | 6.7 / 11.0 km | 6.7 / 10.9 km | **6.5 / 10.0 km** | 6.5 / 10.1 km |
+| Fixes > 50 km off | 0 | 0 | 0 | 0 |
+| **Tie-point error, median / worst fix** | | | **0.7 / 1.0 km** | |
+| Time per photo | 0.74 s | 0.64 s | **0.44 s mean, 0.34 s median** | 0.56 s |
+| Energy per photo | ~6 J | ~5 J | **~3.3 J** | ~4 J |
+
+- **The real accuracy is ~0.7 km.** "Median error" above is the frame centre found by extrapolating the homography from the matched tile (~60 km) to the corners of the ~454 km frame, which inflates small errors. Graded at the tie points (each point vs the true ground point of its pixel from the GeoTIFF geotransform, `grade_tie_points.py`): 0.7 km median per fix, 0.8 km p90, 1.0 km worst, on all 124 fixes. The tie points are what OD uses.
+- Near-nadir frames like Argus's localize far better than astronaut photos: 6.7 km vs 16 km median by the same centre measure, and no fix more than 50 km off. (Astronaut photos have truth only at the corners, so they can't be graded at the tie points.)
+- **Fixes depend on latitude/season:** southern zones (R, S; ~25–40° N) fix 12–13 of 13 in most zones; northern zones (T; ~40–48° N) fail often (16T 0, 17T 1, 32T 3, 54T 3, 10T 6, 33T 7 of 13). The northern GeoTIFFs are mosaics of Landsat scenes from different seasons, many snow-covered or winter-brown with hard seams, while the database tiles (2021) are cloud-free, snow-free summer-looking imagery. See Known issues.
+- Correct tile among the 10 checked: 77.9%. Each frame is larger than a tile, so only a few tiles overlap it well.
+- **Stopping at the first good tile keeps every fix:** tiles checked drop from 10 to 5.1 per frame on average.
+- **TensorRT LightGlue at 1,024 points beats the PyTorch version here** (+5 fixes, 0.1 s faster), so it is the current setup. On the astronaut photos it loses 2 fixes. Fewer points (768) costs too many fixes on these frames.
 
 ## Real two-frame pairs
 
@@ -98,9 +120,63 @@ OD needs at least two photos from the same pass. These are real consecutive phot
   - fetch times for more pairs
   - run OD on the pairs with both fixes. The astronaut photos are oblique, so the photo centre is not below the ISS; the OD step has to allow for that or use the tie points.
 
+## Localization → OD
+
+`od/simulate_pass.py` runs one simulated Argus pass through FSW-Payload's Python batch OD (`python_od` in an FSW-Payload checkout, default `repos/FSW-Payload/python_od`, or set `FSW_PYTHON_OD`; CasADi/IPOPT; needs `casadi` and `scipy`). OD solves position, velocity, attitude and gyro bias from landmark bearings plus gyro.
+
+1. **Truth:** circular orbit at 600 km (two-body + J2), 97.8° inclination, nadir-pointing camera, gyro at 1 Hz with bias and noise.
+2. **Frames:** a 1024 × 1024 frame every 20 s (Argus K, centre square). Each frame's 8 × 8 pixel grid is ray-cast to the WGS84 ellipsoid.
+3. **Simulated localization:**
+   - a fix on 59.6% of frames;
+   - each fixed frame is shifted by one error drawn from the 208 simulated Argus images' real fix errors (median ~7 km), in a random direction, plus 0.3 km per-point noise;
+   - every point is a tie point (u, v, lat, lon), like the pipeline's output.
+4. **OD input:** tie points → `landmark_measurements.csv` (body-frame bearing, landmark ECI, per-point sigma = median error / altitude) + `imu_data.csv`, FSW-Payload's own format.
+5. **Output:** `od/runs/<name>/`: `od_summary.json`, `od_states.csv`, `truth.csv`, `od_pass.png` (ground track, OD error over time).
+
+| Pass (3 random seeds each) | Frames with a fix | OD position error, median | OD velocity error, median |
+|---|---|---|---|
+| Perfect localization (check of the chain) | 31 of 31 | 0.15 km | 1.0 m/s |
+| 10 min, measured fix rate and errors | 19–21 of 31 | 2.4–2.9 km | 4–19 m/s |
+| 25 min, measured fix rate and errors | ~45 of 76 | 0.8–2.3 km | 2–5 m/s |
+
+- **OD beats each single fix:** ~7 km per frame becomes ~1–3 km after OD, because the orbit dynamics average many frames.
+- **A longer arc helps most:** 10 min leaves the velocity weak, so the error grows toward the ends.
+- **Simplifications:**
+  - Earth rotation is GMST only;
+  - body frame = camera frame;
+  - no drag;
+  - no wrong fixes (none on the simulated Argus images);
+  - errors are simulated from measured statistics (see below for real frames).
+
+### Real localization along the orbit
+
+The same pass, but the tie points come from the real pipeline on the Jetson:
+
+1. `simulate_pass.py --poses-only` writes each frame's position and attitude.
+2. `od/render_pass.py` (workstation) ray-casts every pixel of each 1024 × 1024 frame to the ground and samples Priyanka's Landsat GeoTIFFs. Frames are true perspective views; frames more than 20% empty are skipped.
+3. The Jetson runs the default setup with `--save-tie-points`.
+4. `simulate_pass.py --tie-points-from` feeds those tie points to OD.
+
+Pass: 600 km, 97.8°, from Libya (31.5° N, 13.5° E) north over Tunisia, Sicily, Sardinia/Corsica and northern Italy. A frame every 10 s for 330 s, 29 of 34 rendered (the last 5 leave the GeoTIFF coverage).
+
+| | Result |
+|---|---|
+| Frames with a fix | 11 of 29 (6 frames are mostly sea and have no correct tile) |
+| Tie-point error (each point vs the true ground point of its pixel) | **~1.2 km median**, ≤ 2.2 km max on every fix; no wrong fixes |
+| Fix error as logged (footprint centre) | 6.1 km median, 35 and 74 km on two frames |
+| OD position error | **1.40 km median**, 2.9 km max, with point sigma 0.002 rad (≈ 1.2 km); 2.13 km with sigma from the logged fix error (0.011 rad) |
+| OD velocity error | 12 m/s median (20 m/s with 0.011 rad) |
+| Gyro bias | recovered to ~5% |
+
+- **The logged fix error overstates the real error.** It extrapolates the homography from the matched tile (~60 km) to the corners of the whole ~440 km frame. When the tie points sit in a small part of the frame (t40, t50: a strip at the top) that extrapolation is far off, even though the points themselves are right. A least-squares homography on the tie points, mapped at the centre pixel, gives 1.2 km median (31 km on t50). On rendered frames the truth "centre" (mean of the 4 corners) is also 2–4 km from the centre pixel's ground point.
+- **OD uses the tie points, so it was never affected;** only the point sigma was set too loose. `od/check_tie_points.py` prints these per-frame numbers.
+- Same on the 208 Argus-like frames: tie points 0.7 km median against 6.5 km logged (see *Square Argus-like frames*).
+- **Fix rate is lower than on Priyanka's frames (38% vs 60%) because of where the pass goes, not the rendering:** the southern half (Libya–Sicily, zones 32S/33S) fixes most frames; northern Italy and the Alps (32T/33T) fix 1 of 12. Priyanka's own 32T frames fix 3 of 13 for the same reason: snow and winter scenes in the GeoTIFFs vs a summer-looking database (see Known issues).
+- Files: `od/runs/real_eu/` (`match_results_pass.json`, `od_pass.png`, `od_summary.json`).
+
 ## Where the time goes
 
-Current setup, 50 photos, Jetson in 15 W mode, nothing else running. "CPU" is the Jetson's ARM CPU (6 cores) and "GPU" is its GPU. Timing each step separately adds ~0.07 s, so the total reads 0.81 s against 0.73 s in a plain run. Produced by `profile_full.py --lightglue-mp --tile-pack ../tile_feats_pack --search-on-gpu`.
+Measured on the PyTorch LightGlue setup (half precision, 0.73 s); the TensorRT engine now takes ~34 ms per tile in place of ~58 ms, and the stop rule checks ~5 tiles instead of 10. 50 photos, Jetson in 15 W mode, nothing else running. "CPU" is the Jetson's ARM CPU (6 cores) and "GPU" is its GPU. Timing each step separately adds ~0.07 s, so the total reads 0.81 s against 0.73 s in a plain run. Produced by `profile_full.py --lightglue-mp --tile-pack ../tile_feats_pack --search-on-gpu`.
 
 | Step | Runs on | ms per photo | Share |
 |---|---|---|---|
@@ -140,96 +216,84 @@ The GPU has no separate memory; it shares the board's 7.6 GB.
 | … PyTorch GPU tensors, peak (reserved), including the GPU database copy | 335 (366) |
 | … the rest: CUDA, cuDNN and cuBLAS libraries, Python | ~1,200 |
 
-### Power (`tegrastats` VDD_IN, the module's total input)
+### Power and battery (approximate)
+
+**Jetson** (`tegrastats` VDD_IN, the module's total input, 15 W mode, current default setup):
 
 | | |
 |---|---|
 | Idle | 4.3 W |
-| Running: average / peak | 8.1 W / 8.5 W |
-| Energy per photo | ~6 J |
-| 100 photos | ~0.16 Wh |
-| Load while running: GPU / CPU | 53% / 20% |
+| Localizing, average | ~7.6 W |
+| Energy per photo | ~3.3 J (0.44 s) |
+| Extra over idle, per photo | ~1.4 J |
+
+**Battery** (Argus BatteryBoard v3.1, [cmu-argus-2/Avionics-BatteryBoard](https://github.com/cmu-argus-2/Avionics-BatteryBoard)): 6 × Panasonic NCR18650GA in 2S3P, 7.2 V nominal (8.4 V full, ~5 V empty), 10.35 Ah ≈ **74.5 Wh**. MAX17205 fuel gauge, battery heaters, per-cell fuses.
+
+| | Energy | Share of the 74.5 Wh pack |
+|---|---|---|
+| One photo | 3.3 J (0.0009 Wh) | ~0.001% |
+| 100 photos, back to back | 330 J (0.09 Wh) | ~0.1% |
+| One pass: Jetson on for 330 s, 34 photos | ~1,470 J (0.41 Wh) | ~0.5% |
+| Jetson idle for 1 h | 4.3 Wh | ~6% |
+| Localizing nonstop for 1 h | ~7.6 Wh | ~10% |
+
+- **'Being on' costs more than localizing:** in a pass, idle power between photos is ~95% of the energy. Turning the Jetson off between passes matters more than making each photo cheaper.
+- **Not included:** converter losses (battery → Jetson), cold reducing capacity, depth-of-discharge limits, other subsystems' load.
+- **Open (avionics):** the Jetson's power allocation per orbit, orbit-average solar input, whether the Jetson may run in eclipse, converter efficiency.
 
 ### What would make it faster, biggest likely win first
-1. **LightGlue in half precision** (`mp=True`): **done, adopted** (0.95 s → 0.81 s, same fixes; see Experiment log).
-2. **Fewer points per image** (1,024 → 512): **tested, rejected** (loses 19 of 109 fixes; see Experiment log).
-3. **Fewer tiles:** top 5 runs at 0.59 s and loses 2 of 109 fixes (see Experiment log).
-4. **Higher power mode:** 15 W caps the GPU at 625 MHz. JetPack 6.2 adds a faster mode for this board, but needs a reflash, so it's a team decision.
-5. **Smaller CPU items** (search on the GPU, tile features in one memory-mapped file): **done, adopted** (0.82 s → 0.73 s, same results; see Experiment log). Keeping all tile features in GPU memory instead gives no further gain. Photo SIFT stays on the CPU (87 ms).
-6. **Fewer GPU launches in LightGlue:** batching all 10 tiles in one call was **tested and is slower** (0.83 s; see Experiment log). Converting LightGlue to TensorRT like the retriever is the remaining option.
+Done and rejected items are in the Experiment log. The TensorRT LightGlue engine takes ~34 ms per tile.
+1. **Higher power mode (MAXN SUPER, JetPack 6.2):** GPU 625 → 1,020 MHz. A LightGlue of the same size runs at 21.6 ms per pair on an Orin Nano in this mode (kornia/lightglue on Hugging Face). Needs a reflash, so it's a team decision.
+2. **Tracking mode:** after the first fix, use OD's predicted position, skip the retriever and match only the 1–3 tiles near it. Part of the OD integration.
+3. **Photo SIFT (CPU) in parallel with the retriever (GPU):** up to ~50 ms.
+4. **SIFT on the GPU (CudaSift):** ~80 ms, but all tile features must be recomputed with it.
+5. **LightGlue's own early exit and point pruning:** off in the fixed-size TensorRT engine; hard to add.
+6. **XFeat + LighterGlue:** ~8 ms per pair, public weights, but poor beyond ~45° of rotation.
 
 ## Experiment log
 
-One change at a time, against a same-day baseline, on the 200 test photos, with the setup current at the time. Per-run results and logs are on the Jetson in `e2e_alps_full/` (`match_results_<tag>.json`, `match_run_<tag>.log`, `tegrastats_match_<tag>.log`).
+One change at a time against a same-day baseline, on the 200 astronaut photos (and the 208 Argus-like frames where noted). Per-run results are on the Jetson in `e2e_alps_full/` and `e2e_geotiff/` (`match_results_<tag>.json`, `match_run_<tag>.log`).
 
-| Change, in the order tried | Time per photo | Accuracy vs baseline | Energy | Decision |
+| Change | Time per photo | Accuracy | Energy | Decision |
 |---|---|---|---|---|
-| Tile SIFT features computed once, stored (3.2 GB) | 3.3 → 1.3 s | identical on 200/200 | 26 → 14 J | adopted |
-| Top 10 tiles instead of 15 | 1.31 → 0.95 s | identical (winner never ranked below #8) | 14 → 10 J | adopted |
-| Top 5 tiles | 0.59 s | loses 2 of 109 fixes | 6 J | not adopted |
-| LightGlue in half precision | 0.95 → 0.81 s | +1 fix; locations move 0.02 km median | 10 → 7 J | adopted |
-| 512 SIFT points instead of 1,024 | 0.78 s | loses 19 of 109 fixes | 7 J | rejected |
-| Half precision + 512 points | 0.83 s | loses 19 of 109 fixes | 6 J | rejected |
-| Search on the GPU + tile features in one memory-mapped file | 0.82 → 0.73 s | identical on 200/200 | 7 → 6 J | adopted |
-| Tile features preloaded in GPU memory | 0.74 s | identical; +1.8 GB memory | 6 J | rejected |
-| Batched LightGlue (10 tiles in one call) | 0.83 s | loses 1 fix | 8 J | rejected: no flash attention with masks, no point pruning |
-| LightGlue as a TensorRT FP16 engine (`lightglue_trt.py`) | 0.74 → 0.65 s | loses 2 of 110 fixes; one fewer fix > 50 km | 6 → 5 J | testing; not default yet |
-| LightGlue as a TensorRT FP32 engine | 1.18 s | +2 fixes | 13 J | rejected: slower |
+| Store tile SIFT features (3.2 GB) | 3.3 → 1.3 s | identical | 26 → 14 J | adopted |
+| Top 10 tiles instead of 15 | 1.31 → 0.95 s | identical | 14 → 10 J | adopted |
+| Top 5 tiles | 0.59 s | −2 of 109 fixes | 6 J | no |
+| LightGlue half precision | 0.95 → 0.81 s | +1 fix | 10 → 7 J | adopted |
+| 512 SIFT points (alone or + half precision) | ~0.8 s | −19 fixes | 6–7 J | no |
+| Search on GPU + memory-mapped tile features | 0.82 → 0.73 s | identical | 7 → 6 J | adopted |
+| Tile features in GPU memory | 0.74 s | identical, +1.8 GB | 6 J | no |
+| Batched LightGlue, PyTorch | 0.83 s | −1 fix | 8 J | no |
+| **LightGlue TensorRT FP16** | 0.74 → 0.65 s | −2 fixes; Argus-like +5 | 6 → 5 J | **adopted** |
+| LightGlue TensorRT FP32 | 1.18 s | +2 fixes | 13 J | no: slower |
+| Tiny retriever (27M, 512-d) | 0.70 s | 54.0% vs 55.0% fix; −0.5 GB | 6 J | backup |
+| 10 tiles per TensorRT call | −6% engine time | — | — | no |
+| 768 points, TensorRT | 0.56 s | Argus-like −31 of 119 | 4 J | no |
+| Tiny + 768 points | 0.55 s | −6 fixes | 4 J | no |
+| LightGlue 7 of 9 layers (FastGlue idea) | 0.57 s | Argus-like −6 of 124 | 5 J | no (option if speed matters more) |
+| LightGlue 6 or 5 layers | — | Argus-like −6 to −8 | — | no |
+| **Stop at first tile with ≥ 30 inliers** | 0.65 → 0.44 s mean | same fixes on both sets | 5 → 3.3 J | **adopted** |
 
-The workstation (RTX 4090) runs the same flow at 0.80 s with tile SIFT per photo and 0.22 s with stored features.
+The workstation (RTX 4090) runs the flow in 0.22 s with stored features.
 
-## What ran on the Jetson
+## What runs on the Jetson
 
-Everything below runs on the Jetson, in one Python process. The Jetson's chip has two processors sharing the same memory: an ARM CPU (6 cores) and a GPU. The last column says which one does each step.
+One Python process (`e2e_match.py`). The ARM CPU (6 cores) and the GPU share memory.
 
-| Step | What happens | Code | Runs on |
-|---|---|---|---|
-| 1. Preprocess | resize to 224 × 224, ImageNet-normalize | `e2e_match.py` (numpy, PIL) | CPU |
-| 2. Retriever | photo → 2048-number fingerprint | `astroloc_full_fp32.trt`, TensorRT FP32 | GPU |
-| 3. Search | dot product against 7,602 tiles × 4 rotations, keep the top 15 (top 10 in the current setup) | `e2e_match.py` (numpy, brute force) | CPU |
-| 4. Feature points | SIFT, up to 1,024 points, image resized to 512, on the photo and each of the 15 tiles. With `--tile-feats` the tiles' points are read from disk instead | repo `SiftLightGlueMatcher`, via LightGlue's SIFT wrapper around OpenCV | CPU |
-| 5. Matching | LightGlue pairs the photo's points with each tile's points | repo `SiftLightGlueMatcher`, LightGlue in PyTorch | GPU |
-| 6. Geometry check | fit a homography with MAGSAC (3 px threshold), count inliers | repo `SiftLightGlueMatcher`, OpenCV | CPU |
-| 7. Fix decision | tile with the most inliers wins; a fix needs ≥ 30 | `e2e_match.py`, same rule as repo `core/pipeline.py` | CPU |
-| 8. Location | photo corners → tile pixels → lat/lon | repo `Georeferencer.estimate_query_footprint` | CPU |
-
-**Output of a fix:** 30+ matched points, each a photo pixel paired with a ground lat/lon. The 16 km figure scores the centre of the photo's footprint against the true centre, the same metric as the repo's `scripts/evaluate.py`.
-
-### Code used
-- **From argus-localization, unmodified (commit `cc75c2b`):** `matchers/sift_lightglue_matcher.py`, `georeference/georeferencer.py`, `core/types.py`, `core/interfaces.py`, `data_loading/earthloc_loader.py`.
-- **Ours:** `e2e_match.py` (the loop, the search, the scoring), `precompute_tile_feats.py` and the ONNX → TensorRT conversion of the retriever.
-- **Differences from `core/pipeline.py`:**
-  - The retriever is the TensorRT engine instead of the PyTorch model. Fingerprints agree with PyTorch to cosine 0.99997.
-  - The photo's SIFT points are extracted once per photo instead of once per candidate tile. The matching logic is untouched.
-  - Tile features are not kept in memory between photos, so memory reflects one photo at a time. With `--tile-feats` they are computed once by the same matcher class, stored on disk, and handed back through the matcher's own tile cache.
-
-### Dependencies on the Jetson
-
-| Package | Version | Source |
+| Step | What happens | Runs on |
 |---|---|---|
-| JetPack / L4T | 6.0 / R36.3 | on the board |
-| Python, CUDA, cuDNN | 3.10.12, 12.2, 8.9.4 | on the board |
-| TensorRT | 8.6.2 | on the board |
-| OpenCV | 4.8.0 | on the board |
-| PIL | 9.0.1 | on the board |
-| PyTorch | 2.4.0a0 (nv24.05) | NVIDIA's JetPack 6.0 wheel, in `pydeps` |
-| numpy | 1.26.4 | in `pydeps` (the board's 1.21.5 is too old for this PyTorch) |
-| kornia | 0.7.1 | in `pydeps` |
-| LightGlue | git `eb42fee` | in `pydeps`; weights `sift_lightglue_v0-1_arxiv.pth` (45 MB) |
-| networkx, jinja2, filelock, fsspec, sympy, mpmath, typing_extensions | 3.2.1, 3.1.4, 3.15.4, 2024.6.1, 1.12.1, 1.3.0, 4.12.2 | in `pydeps`, required by PyTorch |
+| 1. Retriever | photo (224 × 224) → 2048-number fingerprint, `astroloc_full_fp32.trt` | GPU |
+| 2. Search | against 7,602 tiles × 4 rotations, keep the top 10 | GPU |
+| 3. Feature points | photo SIFT, 1,024 points at 512 px; tile points read from `tile_feats_pack` | CPU |
+| 4. Matching | LightGlue TensorRT FP16 engine, photo vs each tile in retrieval order | GPU |
+| 5. Geometry check | MAGSAC homography (3 px), count inliers; stop at the first tile with ≥ 30 | CPU |
+| 6. Output | the tile's inlier points as tie points (photo pixel → lat/lon) and the photo's footprint | CPU |
 
-`pydeps` is `~/Desktop/astroloc/pydeps`, installed with `pip3 install --no-deps --target` and used through `PYTHONPATH`. Nothing was installed system-wide and no sudo was used. torchvision is not installed and not needed.
-
-### Resources
-
-Time, memory and power per step are under *Where the time goes*.
-
-**Disk for the flow:**
-- engine 410 MB, fingerprints 249 MB, `pydeps` 2.0 GB, LightGlue weights 45 MB
-- packed tile features 2.15 GB
-- the tile images (720 MB) stay on disk, because their filenames carry each tile's corner coordinates
-
-**Handoff to OD (not run yet):** `Georeferencer.make_tie_points` turns a fix into tie points, and `integration/batchopt_adapter.py::to_batchopt_measurements` converts them to the rows the FSW-Payload solver takes (timestamp, bearing in the body frame, landmark position in ECI). The adapter needs a GNC-Payload checkout and `brahe`, neither of which is on the Jetson.
+- **Repo code used unmodified** (argus-localization `cc75c2b`): `SiftLightGlueMatcher`, `Georeferencer`, `core/types.py`, `data_loading/earthloc_loader.py`. Ours: `e2e_match.py`, `lightglue_trt.py`, the tile-feature packing and the TensorRT conversions.
+- **Differences from `core/pipeline.py`:** TensorRT retriever (cosine 0.99997 vs PyTorch); photo SIFT extracted once per photo; stop rule instead of always checking every tile.
+- **Dependencies:** JetPack 6.0 (L4T R36.3, CUDA 12.2, TensorRT 8.6.2, OpenCV 4.8.0) on the board; PyTorch 2.4.0a0 (NVIDIA wheel), numpy 1.26.4, kornia 0.7.1, LightGlue `eb42fee` and PyTorch's small deps in `~/Desktop/astroloc/pydeps` (`pip3 install --no-deps --target`, used via `PYTHONPATH`; nothing system-wide, no sudo).
+- **Disk:** engines ~0.5 GB, fingerprints 249 MB, `pydeps` 2.0 GB, packed tile features 2.15 GB, tile images 720 MB (their filenames carry the tile corners).
+- **Handoff to OD:** `--save-tie-points` writes each fix's tie points; `od/simulate_pass.py` turns them into FSW-Payload's input files (see *Localization → OD*).
 
 ## Files
 
@@ -259,8 +323,8 @@ Check `nvidia-smi` first and use a free GPU.
 ### 2. Jetson, retrieval only
 ```bash
 cd ~/Desktop/astroloc
-scp <you>@172.24.58.65:~/astroloc_full_static.onnx .
-scp -r <you>@172.24.58.65:~/e2e_alps_full .
+scp soham@172.24.58.65:~/astroloc_full_static.onnx .
+scp -r soham@172.24.58.65:~/e2e_alps_full .
 /usr/src/tensorrt/bin/trtexec --onnx=astroloc_full_static.onnx --saveEngine=astroloc_full_fp32.trt
 python3 e2e_jetson.py --engine astroloc_full_fp32.trt --data e2e_alps_full
 ```
@@ -321,11 +385,20 @@ python3 visualize_trace.py --trace walkthrough/pipeline_walkthrough/data --out w
 |---|---|---|
 | `e2e_prepare.py` | workstation | builds the zoom-9 database, picks test photos, workstation results |
 | `e2e_jetson.py` | Jetson | retrieval-only test with the TensorRT engine, compares to workstation |
-| `e2e_match.py` | both | adds the matcher on top of retrieval; `--engine` runs the TensorRT retriever in the same process, `--tile-feats` uses stored tile features |
+| `e2e_match.py` | both | adds the matcher on top of retrieval; `--engine` runs the TensorRT retriever in the same process, `--tile-feats` uses stored tile features, `--stop-inliers N` stops at the first tile with ≥ N inliers, `--log-tiles` records every tile's inliers, `--save-tie-points` stores each fix's (u, v, lat, lon) points; every fix logs `tie_error_km` (tie points vs truth from the photo's corners, the error OD sees) next to `match_error_km` (footprint centre) |
 | `precompute_tile_feats.py` | both | computes and stores the SIFT features of every tile, once |
 | `run_match_full.sh` | Jetson | runs `e2e_match.py` with `tegrastats` logging; the first argument tags the output files |
 | `profile_match.py` | Jetson | times each matcher stage on 20 photos |
 | `compare_topk.py` | Jetson | compares full-flow runs side by side (`--ks` or `--tags`) |
+| `od/simulate_pass.py` | Mac | simulated Argus pass → simulated (or, with `--tie-points-from`, real) localization tie points → FSW-Payload Python OD, compared with truth; `--poses-only` writes frame poses for rendering |
+| `od/render_pass.py` | workstation | renders a pass's frames from the Landsat GeoTIFFs as an e2e test set |
+| `grade_tie_points.py` | workstation | per-tie-point error on the Argus-like GeoTIFF frames (truth from each GeoTIFF's geotransform) |
+| `od/check_tie_points.py` | Mac | per-tie-point error of a rendered pass against the true poses |
+| `simulate_stop.py` | any | replays stop-at-first-good-tile thresholds on a `--log-tiles` result |
+| `run_stop.sh` | Jetson | timed runs, all 10 tiles vs `--stop-inliers 30`, on both test sets |
+| `lightglue_trt.py` | workstation, Jetson | LightGlue as a fixed-size network: export to ONNX (`export --points --batch --layers`), check against PyTorch (`check`); used by `e2e_match.py --lightglue-trt` |
+| `trt_lg_bench.py` | Jetson | time each step around the TensorRT LightGlue engine |
+| `prepare_geotiff_set.py` | workstation | square Argus-like test frames from the Landsat GeoTIFFs |
 | `run_speed.sh` | Jetson | current vs half precision vs 512 points vs both |
 | `run_speed2.sh` | Jetson | current vs small CPU fixes vs preloaded tile features vs batched LightGlue |
 | `pack_tile_feats.py` | Jetson | packs the 7,602 tile feature files into one set of arrays (`--tile-pack`) |
@@ -339,12 +412,12 @@ python3 visualize_trace.py --trace walkthrough/pipeline_walkthrough/data --out w
 ## Environment
 
 - **Workstation:** `~/venv-export` (inherits `sat_env_vision`'s CUDA torch, plus onnx, onnxruntime, onnxscript, shapely, `numpy<2.2`, kornia 0.7.1, LightGlue). No sudo.
-- **Jetson:** versions are listed under *What ran on the Jetson*. `trtexec` is at `/usr/src/tensorrt/bin/trtexec`. pycuda 2022.2.2 is used by `e2e_jetson.py`. 838 GB free disk. No internet, so packages are downloaded elsewhere and copied over.
-- **Mac → Jetson:** VS Code needs Local Network permission (System Settings → Privacy & Security). Or route through the workstation: `ssh -J <you>@172.24.58.65 argus@<jetson-ip>`. The Jetson's address changes (currently 172.26.104.106); run `hostname -I` on it to check.
+- **Jetson:** versions are listed under *What runs on the Jetson*. `trtexec` is at `/usr/src/tensorrt/bin/trtexec`. pycuda 2022.2.2 is used by `e2e_jetson.py`. 838 GB free disk. No internet, so packages are downloaded elsewhere and copied over.
+- **Mac → Jetson:** VS Code needs Local Network permission (System Settings → Privacy & Security). Or route through the workstation: `ssh -J soham@172.24.58.65 argus@<jetson-ip>`. The Jetson's address changes (currently 172.26.11.80); run `hostname -I` on it to check.
 
 ## Known issues
 
-1. **Pick the right checkpoint.** Nano v1 (`nano_train/checkpoints/`) scores 3% top-1; v2 scores 34.5%. There are ten full-size checkpoints, two from the latest training round (`checkpoints_faithful_lora_v2`, `checkpoints_faithful_dynamic_v2`); only `checkpoints_faithful_lora_v2` has been tested, and the repo's own OD code names it the current best model. A newer AstroLoc-tiny run, `nano_train/checkpoints_faithful_dynamic`, is untested here.
+1. **Pick the right checkpoint.** Nano v1 (`nano_train/checkpoints/`) scores 3% top-1; v2 scores 34.5%. There are ten full-size checkpoints, two from the latest training round (`checkpoints_faithful_lora_v2`, `checkpoints_faithful_dynamic_v2`); only `checkpoints_faithful_lora_v2` has been tested, and the repo's own OD code names it the current best model. A newer AstroLoc-tiny run, `nano_train/checkpoints_faithful_dynamic`, nearly matches full-size on the 200 photos (see Experiment log); it is not yet on the Jetson.
 2. **LoRA checkpoints saved before commit `cc75c2b` (nano v2 among them) need their weight names remapped.** That commit renames LoRA weights (`blocks.N.` → `blocks.N.block.`). Our scripts remap the names on load, and so does the repo's own loader from `d92f5bc` on.
 3. **TensorRT needs a static batch and opset 17.** Export with `--static-batch --batch 1 --opset 17`.
 4. **FP16 rejected.** 2× faster but cosine 0.877 vs FP32 — enough to retrieve wrong tiles.
@@ -356,11 +429,11 @@ python3 visualize_trace.py --trace walkthrough/pipeline_walkthrough/data --out w
    - The team uses square images (Priyanka's decision), so our square test photos (1024 × 1024) match the flight input.
    - The Argus camera sensor is 4608 × 2592.
    - Priyanka's GeoTIFF evaluation (`/mnt/sdc1/astroloc/reference_db/argus_geotiff_eval`) supports the square choice. With a centre square crop, R@1 is 71.1% against 55.0% squashing the whole frame. With the matcher, the crop gives a fix on 68.8% of frames and a 5.4 km median error.
+10. **Snow / winter imagery fails to match (paused, come back to later).** Northern GeoTIFF zones (~40–48° N) fix 0–7 of 13 frames against 12–13 in the south, because their Landsat mosaics include snow-covered and winter scenes while the database tiles look like summer. A real Argus photo over snow in winter would hit the same problem. Options when we return: a winter database (the other years 2018–2020 may differ in season; unchecked), or reporting north and south separately. For now we go with the current database.
 
 ## Next steps
 
-1. **Connect to OD** — run the tie points through the adapter and the FSW-Payload solver.
-2. **Default setup: top 10 tiles + LightGlue half precision + search on the GPU + packed tile features** (0.73 s per photo). Remaining speed options: a higher power mode, the search on the GPU, tile features in one file, and shrinking the stored features (3.2 GB as 32-bit floats).
+1. **OD** — chain runs on real localization (1.4 km; tie points ~1.2 km). Next: a longer pass over the southern zones.
+2. **Default setup: top 10 tiles, search on the GPU, packed tile features, TensorRT LightGlue (1,024 points), stop at the first tile with ≥ 30 inliers** (0.44 s per photo on average). Remaining speed options: see *What would make it faster*.
 3. **Reject wrong fixes** — 4 of 109 are more than 50 km off.
-4. **Argus-like square frames on the Jetson:** run square crops of the simulated Argus GeoTIFFs end to end, for accuracy and for the time at full resolution.
-5. **Coordinate error for OD** — being modelled by Priyanka and Pedro.
+4. **Coordinate error for OD** — being modelled by Priyanka and Pedro.
